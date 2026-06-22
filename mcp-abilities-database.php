@@ -3,7 +3,7 @@
  * Plugin Name: MCP Abilities - Database
  * Plugin URI: https://devenia.com
  * Description: Controlled database maintenance abilities for MCP. Provides confirm-gated search/replace for WordPress post content.
- * Version: 0.1.0
+ * Version: 0.1.1
  * Author: Devenia
  * Author URI: https://devenia.com
  * License: GPL-2.0+
@@ -121,6 +121,72 @@ function mcp_database_get_post_content_candidates( string $search, array $post_t
 	}
 
 	return $rows;
+}
+
+/**
+ * List posts whose post_content contains a search string.
+ *
+ * @param array<string, mixed> $input Ability input.
+ * @return array<string, mixed>
+ */
+function mcp_database_list_post_content_matches( array $input ): array {
+	$search = isset( $input['search'] ) ? (string) $input['search'] : '';
+	$limit  = isset( $input['limit'] ) ? max( 0, min( 10000, (int) $input['limit'] ) ) : 0;
+
+	if ( '' === $search ) {
+		return array(
+			'success' => false,
+			'message' => 'The search string is required.',
+		);
+	}
+
+	$post_types = mcp_database_normalize_string_list(
+		$input['post_types'] ?? array( 'page' ),
+		array( 'page' ),
+		get_post_types( array(), 'names' )
+	);
+
+	$post_statuses = mcp_database_normalize_string_list(
+		$input['post_statuses'] ?? array( 'publish' ),
+		array( 'publish' ),
+		array( 'publish', 'draft', 'pending', 'private', 'future' )
+	);
+
+	$rows    = mcp_database_get_post_content_candidates( $search, $post_types, $post_statuses, $limit );
+	$matches = array();
+	$total_occurrences = 0;
+
+	foreach ( $rows as $row ) {
+		$post_id = isset( $row['ID'] ) ? (int) $row['ID'] : 0;
+		$content = isset( $row['post_content'] ) ? (string) $row['post_content'] : '';
+		$count   = substr_count( $content, $search );
+
+		if ( $post_id < 1 || $count < 1 ) {
+			continue;
+		}
+
+		$total_occurrences += $count;
+		$matches[] = array(
+			'id'               => $post_id,
+			'title'            => html_entity_decode( wp_strip_all_tags( (string) ( $row['post_title'] ?? '' ) ), ENT_QUOTES ),
+			'post_type'        => (string) ( $row['post_type'] ?? '' ),
+			'post_status'      => (string) ( $row['post_status'] ?? '' ),
+			'link'             => get_permalink( $post_id ),
+			'occurrence_count' => $count,
+		);
+	}
+
+	return array(
+		'success'            => true,
+		'search'             => $search,
+		'post_types'         => $post_types,
+		'post_statuses'      => $post_statuses,
+		'limit'              => $limit,
+		'match_count'        => count( $matches ),
+		'occurrences_found'  => $total_occurrences,
+		'matches'            => $matches,
+		'message'            => sprintf( 'Found %d posts containing the search string.', count( $matches ) ),
+	);
 }
 
 /**
@@ -466,6 +532,61 @@ function mcp_register_database_abilities(): void {
 				'annotations' => array(
 					'readonly'    => false,
 					'destructive' => true,
+					'idempotent'  => true,
+				),
+			),
+		)
+	);
+
+	wp_register_ability(
+		'database/list-post-content-matches',
+		array(
+			'label'               => 'List Post Content Matches',
+			'description'         => 'Lists posts whose raw wp_posts.post_content contains a search string for selected post types and statuses.',
+			'category'            => 'site',
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'required'             => array( 'search' ),
+				'properties'           => array(
+					'search'        => array( 'type' => 'string' ),
+					'post_types'    => array(
+						'type'    => 'array',
+						'items'   => array( 'type' => 'string' ),
+						'default' => array( 'page' ),
+					),
+					'post_statuses' => array(
+						'type'    => 'array',
+						'items'   => array( 'type' => 'string' ),
+						'default' => array( 'publish' ),
+					),
+					'limit'         => array( 'type' => 'integer', 'default' => 0 ),
+				),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => array(
+				'type'       => 'object',
+				'properties' => array(
+					'success'           => array( 'type' => 'boolean' ),
+					'search'            => array( 'type' => 'string' ),
+					'post_types'        => array( 'type' => 'array' ),
+					'post_statuses'     => array( 'type' => 'array' ),
+					'limit'             => array( 'type' => 'integer' ),
+					'match_count'       => array( 'type' => 'integer' ),
+					'occurrences_found' => array( 'type' => 'integer' ),
+					'matches'           => array( 'type' => 'array' ),
+					'message'           => array( 'type' => 'string' ),
+				),
+			),
+			'execute_callback'    => static function ( array $input = array() ): array {
+				return mcp_database_list_post_content_matches( $input );
+			},
+			'permission_callback' => static function (): bool {
+				return current_user_can( 'manage_options' );
+			},
+			'meta'                => array(
+				'annotations' => array(
+					'readonly'    => true,
+					'destructive' => false,
 					'idempotent'  => true,
 				),
 			),

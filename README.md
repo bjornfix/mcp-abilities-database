@@ -8,7 +8,7 @@ Controlled database maintenance abilities for MCP. Provides confirm-gated search
 [![PHP](https://img.shields.io/badge/PHP-8.0%2B-purple.svg)](https://php.net)
 
 **Tested up to:** 7.0
-**Stable tag:** 0.1.0
+**Stable tag:** 0.1.1
 **License:** GPLv2 or later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -110,6 +110,7 @@ If you skip base-stack verification and start with add-ons immediately, troubles
 ## Abilities
 
 - `database/search-replace-post-content`
+- `database/list-post-content-matches`
 - `database/regex-replace-post-content`
 
 ## Safety Model
@@ -120,6 +121,7 @@ The abilities are scoped to post content and selected post types/statuses. Use d
 
 ### Current
 
+- 0.1.1: Add read-only post content match listing for exact maintenance queues.
 - Documentation aligned with the public plugin README standard.
 
 ## Contributing
