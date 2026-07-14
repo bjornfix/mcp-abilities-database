@@ -8,7 +8,7 @@ Controlled database maintenance abilities for MCP. Provides confirm-gated search
 [![PHP](https://img.shields.io/badge/PHP-8.0%2B-purple.svg)](https://php.net)
 
 **Tested up to:** 7.0
-**Stable tag:** 0.1.1
+**Stable tag:** 0.1.2
 **License:** GPLv2 or later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -112,15 +112,18 @@ If you skip base-stack verification and start with add-ons immediately, troubles
 - `database/search-replace-post-content`
 - `database/list-post-content-matches`
 - `database/regex-replace-post-content`
+- `database/audit-core-table-engines`
+- `database/convert-core-tables-to-innodb`
 
 ## Safety Model
 
-The abilities are scoped to post content and selected post types/statuses. Use dry-run output first, then run confirmed writes only after reviewing the affected rows.
+Post-content abilities are scoped to selected post types/statuses. Table-engine abilities accept only fixed logical WordPress core table keys, resolve physical table names through WordPress, and never accept arbitrary SQL or table identifiers. On multisite, network-global table keys require super-admin status plus network-options authority for audit, dry-run, and live requests. Engine conversion defaults to dry-run, requires an explicit table list, and requires both `dry_run=false` and `confirm=true` for live DDL. Each result separates the reported database statement outcome, verified postcondition, and known or unknown mutation; aggregate partial state is nullable when the database effect cannot be proven.
 
 ## Changelog
 
 ### Current
 
+- 0.1.2: Add allowlisted core table-engine audit and confirm-gated InnoDB conversion.
 - 0.1.1: Add read-only post content match listing for exact maintenance queues.
 - Documentation aligned with the public plugin README standard.
 
@@ -134,7 +137,7 @@ GPL-2.0+
 
 ## Author
 
-[Devenia](https://devenia.com) - We've been doing SEO and web development since 1993.
+[basicus](https://profiles.wordpress.org/basicus/)
 
 ## Links
 
