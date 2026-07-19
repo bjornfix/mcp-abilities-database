@@ -3,7 +3,7 @@
  * Plugin Name: MCP Abilities - Database
  * Plugin URI: https://devenia.com
  * Description: Controlled database maintenance abilities for MCP, including post-content maintenance and WordPress database health audits.
- * Version: 0.1.3
+ * Version: 0.1.4
  * Author: basicus
  * Author URI: https://profiles.wordpress.org/basicus/
  * License: GPL-2.0+
@@ -898,6 +898,126 @@ function mcp_database_audit_options_health( array $input = array() ): array {
 		'issue_count'              => count( $issues ),
 		'issues'                   => $issues,
 		'message'                  => sprintf( 'Audited %d options, including %d autoloaded rows and %d expired transient timeout rows.', (int) ( $summary['option_count'] ?? 0 ), (int) ( $summary['autoload_count'] ?? 0 ), $expired_transient_count ),
+	);
+}
+
+/**
+ * Delete a bounded batch of expired site transients.
+ *
+ * The timeout rows are selected from the exact current-site options table, but
+ * deletion goes through the WordPress option API so persistent object caches
+ * are invalidated correctly. Names and values are never returned.
+ *
+ * @param array<string, mixed> $input Cleanup controls.
+ * @return array<string, mixed>
+ */
+function mcp_database_cleanup_expired_transients( array $input = array() ): array {
+	global $wpdb;
+
+	$limit   = max( 1, min( 500, (int) ( $input['limit'] ?? 100 ) ) );
+	$dry_run = ! array_key_exists( 'dry_run', $input ) || (bool) $input['dry_run'];
+	$confirm = (bool) ( $input['confirm'] ?? false );
+	$before  = mcp_database_audit_options_health( array( 'limit' => 1 ) );
+
+	if ( ! $dry_run && ! $confirm ) {
+		return array(
+			'success'                    => false,
+			'dry_run'                    => false,
+			'confirmed'                  => false,
+			'limit'                      => $limit,
+			'expired_before'             => (int) ( $before['expired_transient_count'] ?? 0 ),
+			'selected_count'             => 0,
+			'deleted_transient_count'    => 0,
+			'deleted_timeout_count'      => 0,
+			'skipped_refreshed_count'    => 0,
+			'failed_count'               => 0,
+			'expired_after'              => (int) ( $before['expired_transient_count'] ?? 0 ),
+			'more_expired_may_remain'    => ! empty( $before['expired_transient_count'] ),
+			'message'                    => 'Live transient cleanup requires dry_run=false and confirm=true. Review a dry run first.',
+		);
+	}
+
+	$now = time();
+	$wpdb->last_error = '';
+	// Select only a bounded batch of expired timeout option names; transient values are never read by SQL or returned.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+	$timeout_rows = $wpdb->get_col(
+		$wpdb->prepare(
+			"SELECT option_name FROM %i WHERE option_name LIKE %s AND CAST(option_value AS UNSIGNED) > 0 AND CAST(option_value AS UNSIGNED) < %d ORDER BY option_id ASC LIMIT %d",
+			$wpdb->options,
+			$wpdb->esc_like( '_transient_timeout_' ) . '%',
+			$now,
+			$limit
+		)
+	);
+
+	if ( '' !== $wpdb->last_error || ! is_array( $timeout_rows ) ) {
+		return array(
+			'success'                    => false,
+			'dry_run'                    => $dry_run,
+			'confirmed'                  => $confirm,
+			'limit'                      => $limit,
+			'expired_before'             => (int) ( $before['expired_transient_count'] ?? 0 ),
+			'selected_count'             => 0,
+			'deleted_transient_count'    => 0,
+			'deleted_timeout_count'      => 0,
+			'skipped_refreshed_count'    => 0,
+			'failed_count'               => 1,
+			'expired_after'              => (int) ( $before['expired_transient_count'] ?? 0 ),
+			'more_expired_may_remain'    => ! empty( $before['expired_transient_count'] ),
+			'message'                    => 'Expired transient candidates could not be read.',
+		);
+	}
+
+	$selected_count          = count( $timeout_rows );
+	$deleted_transient_count = 0;
+	$deleted_timeout_count   = 0;
+	$skipped_refreshed_count = 0;
+	$failed_count            = 0;
+
+	if ( ! $dry_run ) {
+		$timeout_prefix = '_transient_timeout_';
+		foreach ( $timeout_rows as $timeout_option_name ) {
+			$timeout_option_name = (string) $timeout_option_name;
+			$transient_name      = substr( $timeout_option_name, strlen( $timeout_prefix ) );
+			$current_timeout     = get_option( $timeout_option_name, false );
+
+			if ( '' === $transient_name || ! is_numeric( $current_timeout ) || (int) $current_timeout <= 0 || (int) $current_timeout >= time() ) {
+				++$skipped_refreshed_count;
+				continue;
+			}
+
+			if ( delete_option( '_transient_' . $transient_name ) ) {
+				++$deleted_transient_count;
+			}
+			delete_option( $timeout_option_name );
+			if ( false === get_option( $timeout_option_name, false ) ) {
+				++$deleted_timeout_count;
+			} else {
+				++$failed_count;
+			}
+		}
+	}
+
+	$after         = $dry_run ? $before : mcp_database_audit_options_health( array( 'limit' => 1 ) );
+	$expired_after = (int) ( $after['expired_transient_count'] ?? 0 );
+
+	return array(
+		'success'                    => 0 === $failed_count && ! empty( $before['success'] ) && ! empty( $after['success'] ),
+		'dry_run'                    => $dry_run,
+		'confirmed'                  => $confirm,
+		'limit'                      => $limit,
+		'expired_before'             => (int) ( $before['expired_transient_count'] ?? 0 ),
+		'selected_count'             => $selected_count,
+		'deleted_transient_count'    => $deleted_transient_count,
+		'deleted_timeout_count'      => $deleted_timeout_count,
+		'skipped_refreshed_count'    => $skipped_refreshed_count,
+		'failed_count'               => $failed_count,
+		'expired_after'              => $expired_after,
+		'more_expired_may_remain'    => $expired_after > 0,
+		'message'                    => $dry_run
+			? sprintf( 'Dry run selected %d expired transient timeout row(s); no options were deleted.', $selected_count )
+			: sprintf( 'Deleted %d expired transient timeout row(s); %d expired timeout row(s) remain.', $deleted_timeout_count, $expired_after ),
 	);
 }
 
@@ -1814,6 +1934,36 @@ function mcp_database_options_health_output_schema(): array {
 }
 
 /**
+ * Get the output schema for bounded expired-transient cleanup.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_transient_cleanup_output_schema(): array {
+	$integer = array( 'type' => 'integer' );
+
+	return array(
+		'type'                 => 'object',
+		'required'             => array( 'success', 'dry_run', 'confirmed', 'limit', 'expired_before', 'selected_count', 'deleted_transient_count', 'deleted_timeout_count', 'skipped_refreshed_count', 'failed_count', 'expired_after', 'more_expired_may_remain', 'message' ),
+		'properties'           => array(
+			'success'                    => array( 'type' => 'boolean' ),
+			'dry_run'                    => array( 'type' => 'boolean' ),
+			'confirmed'                  => array( 'type' => 'boolean' ),
+			'limit'                      => $integer,
+			'expired_before'             => $integer,
+			'selected_count'             => $integer,
+			'deleted_transient_count'    => $integer,
+			'deleted_timeout_count'      => $integer,
+			'skipped_refreshed_count'    => $integer,
+			'failed_count'               => $integer,
+			'expired_after'              => $integer,
+			'more_expired_may_remain'    => array( 'type' => 'boolean' ),
+			'message'                    => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+}
+
+/**
  * Get the output schema for the bounded database health snapshot.
  *
  * @return array<string, mixed>
@@ -1930,6 +2080,40 @@ function mcp_register_database_abilities(): void {
 				return current_user_can( 'manage_options' );
 			},
 			'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false, 'idempotent' => true ) ),
+		)
+	);
+
+	wp_register_ability(
+		'database/cleanup-expired-transients',
+		array(
+			'label'               => 'Clean Up Expired WordPress Transients',
+			'description'         => 'Plans or deletes a bounded batch of expired current-site transient option pairs. Defaults to dry-run and never returns transient names or values.',
+			'category'            => 'site',
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'default'              => array(),
+				'properties'           => array(
+					'limit'   => array( 'type' => 'integer', 'default' => 100, 'minimum' => 1, 'maximum' => 500 ),
+					'dry_run' => array( 'type' => 'boolean', 'default' => true ),
+					'confirm' => array( 'type' => 'boolean', 'default' => false ),
+				),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => mcp_database_transient_cleanup_output_schema(),
+			'execute_callback'    => static function ( $input = array() ): array {
+				return mcp_database_cleanup_expired_transients( is_array( $input ) ? $input : array() );
+			},
+			'permission_callback' => static function ( $input = array() ): bool {
+				unset( $input );
+				return current_user_can( 'manage_options' );
+			},
+			'meta'                => array(
+				'annotations' => array(
+					'readonly'    => false,
+					'destructive' => true,
+					'idempotent'  => true,
+				),
+			),
 		)
 	);
 
