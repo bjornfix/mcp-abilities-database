@@ -3,7 +3,7 @@
  * Plugin Name: MCP Abilities - Database
  * Plugin URI: https://devenia.com
  * Description: Controlled database maintenance abilities for MCP, including post-content maintenance and WordPress database health audits.
- * Version: 0.1.4
+ * Version: 0.1.5
  * Author: basicus
  * Author URI: https://profiles.wordpress.org/basicus/
  * License: GPL-2.0+
@@ -1022,6 +1022,210 @@ function mcp_database_cleanup_expired_transients( array $input = array() ): arra
 }
 
 /**
+ * Read bounded metadata for one exact option without loading its value.
+ *
+ * @param string $option_name Exact option name.
+ * @return array<string, mixed>|null
+ */
+function mcp_database_option_autoload_metadata( string $option_name ): ?array {
+	global $wpdb;
+
+	$wpdb->last_error = '';
+	// Read only the caller-selected option's name, autoload state, and byte size; never select its value.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching
+	$row = $wpdb->get_row(
+		$wpdb->prepare(
+			'SELECT option_name, autoload, OCTET_LENGTH(option_value) AS value_bytes FROM %i WHERE option_name = %s',
+			$wpdb->options,
+			$option_name
+		),
+		ARRAY_A
+	);
+
+	if ( '' !== $wpdb->last_error || ! is_array( $row ) ) {
+		return null;
+	}
+
+	return array(
+		'option_name' => (string) ( $row['option_name'] ?? '' ),
+		'autoload'    => (string) ( $row['autoload'] ?? '' ),
+		'value_bytes' => (int) ( $row['value_bytes'] ?? 0 ),
+	);
+}
+
+/**
+ * Determine whether a stored WordPress autoload state is enabled.
+ *
+ * @param string $autoload Stored autoload value.
+ */
+function mcp_database_autoload_is_enabled( string $autoload ): bool {
+	return in_array( strtolower( $autoload ), array( 'yes', 'on', 'auto', 'auto-on' ), true );
+}
+
+/**
+ * Validate a bounded exact option-name selection.
+ *
+ * @param mixed $value Requested option names.
+ * @return array{valid: bool, option_names: string[], invalid_option_names: string[]}
+ */
+function mcp_database_validate_option_names( mixed $value ): array {
+	if ( ! is_array( $value ) || empty( $value ) || count( $value ) > 25 ) {
+		return array( 'valid' => false, 'option_names' => array(), 'invalid_option_names' => array() );
+	}
+
+	$option_names = array();
+	$invalid      = array();
+	foreach ( $value as $option_name ) {
+		if ( ! is_string( $option_name ) || '' === $option_name || strlen( $option_name ) > 191 || preg_match( '/[\x00-\x1F\x7F]/', $option_name ) || str_starts_with( $option_name, '_transient_' ) || str_starts_with( $option_name, '_site_transient_' ) ) {
+			$invalid[] = is_scalar( $option_name ) ? (string) $option_name : '(non-scalar)';
+			continue;
+		}
+		$option_names[] = $option_name;
+	}
+
+	$option_names = array_values( array_unique( $option_names ) );
+	$invalid      = array_values( array_unique( $invalid ) );
+	return array(
+		'valid'                => empty( $invalid ) && ! empty( $option_names ),
+		'option_names'         => $option_names,
+		'invalid_option_names' => $invalid,
+	);
+}
+
+/**
+ * Set autoload state for an explicit bounded option selection without touching values.
+ *
+ * @param array<string, mixed> $input Autoload controls.
+ * @return array<string, mixed>
+ */
+function mcp_database_set_option_autoload( array $input ): array {
+	$selection       = mcp_database_validate_option_names( $input['option_names'] ?? null );
+	$dry_run         = ! array_key_exists( 'dry_run', $input ) || (bool) $input['dry_run'];
+	$confirm         = (bool) ( $input['confirm'] ?? false );
+	$target_autoload = (bool) ( $input['autoload'] ?? false );
+
+	if ( ! $selection['valid'] ) {
+		return array(
+			'success'                => false,
+			'dry_run'                => $dry_run,
+			'confirmed'              => $confirm,
+			'target_autoload'        => $target_autoload,
+			'option_names'           => $selection['option_names'],
+			'invalid_option_names'   => $selection['invalid_option_names'],
+			'requested_count'        => count( $selection['option_names'] ),
+			'planned_count'          => 0,
+			'changed_count'          => 0,
+			'unchanged_count'        => 0,
+			'missing_count'          => 0,
+			'failed_count'           => 0,
+			'results'                => array(),
+			'message'                => 'Provide between 1 and 25 valid non-transient option names.',
+		);
+	}
+
+	if ( ! $dry_run && ! $confirm ) {
+		return array(
+			'success'                => false,
+			'dry_run'                => false,
+			'confirmed'              => false,
+			'target_autoload'        => $target_autoload,
+			'option_names'           => $selection['option_names'],
+			'invalid_option_names'   => array(),
+			'requested_count'        => count( $selection['option_names'] ),
+			'planned_count'          => 0,
+			'changed_count'          => 0,
+			'unchanged_count'        => 0,
+			'missing_count'          => 0,
+			'failed_count'           => 0,
+			'results'                => array(),
+			'message'                => 'Live autoload changes require dry_run=false and confirm=true. Review a dry run first.',
+		);
+	}
+
+	$results         = array();
+	$planned_count   = 0;
+	$changed_count   = 0;
+	$unchanged_count = 0;
+	$missing_count   = 0;
+	$failed_count    = 0;
+	foreach ( $selection['option_names'] as $option_name ) {
+		$before = mcp_database_option_autoload_metadata( $option_name );
+		if ( null === $before ) {
+			++$missing_count;
+			$results[] = array(
+				'option_name'    => $option_name,
+				'exists'         => false,
+				'value_bytes'    => 0,
+				'before_autoload' => null,
+				'after_autoload' => null,
+				'planned'        => false,
+				'changed'        => false,
+				'success'        => true,
+				'error_code'     => null,
+			);
+			continue;
+		}
+
+		$before_enabled = mcp_database_autoload_is_enabled( (string) $before['autoload'] );
+		$planned        = $before_enabled !== $target_autoload;
+		if ( $planned ) {
+			++$planned_count;
+		}
+		$after          = $before;
+		$success        = true;
+		$error_code     = null;
+
+		if ( ! $dry_run && $planned ) {
+			wp_set_option_autoload( $option_name, $target_autoload );
+			$after   = mcp_database_option_autoload_metadata( $option_name );
+			$success = null !== $after && mcp_database_autoload_is_enabled( (string) $after['autoload'] ) === $target_autoload;
+			if ( ! $success ) {
+				$error_code = 'autoload_postcondition_failed';
+				++$failed_count;
+			}
+		}
+
+		$changed = ! $dry_run && $success && $planned;
+		if ( $changed ) {
+			++$changed_count;
+		} elseif ( ! $planned ) {
+			++$unchanged_count;
+		}
+
+		$results[] = array(
+			'option_name'     => $option_name,
+			'exists'          => true,
+			'value_bytes'     => (int) $before['value_bytes'],
+			'before_autoload' => (string) $before['autoload'],
+			'after_autoload'  => $dry_run || null === $after ? null : (string) $after['autoload'],
+			'planned'         => $planned,
+			'changed'         => $changed,
+			'success'         => $success,
+			'error_code'      => $error_code,
+		);
+	}
+
+	return array(
+		'success'                => 0 === $failed_count,
+		'dry_run'                => $dry_run,
+		'confirmed'              => $confirm,
+		'target_autoload'        => $target_autoload,
+		'option_names'           => $selection['option_names'],
+		'invalid_option_names'   => array(),
+		'requested_count'        => count( $selection['option_names'] ),
+		'planned_count'          => $planned_count,
+		'changed_count'          => $changed_count,
+		'unchanged_count'        => $unchanged_count,
+		'missing_count'          => $missing_count,
+		'failed_count'           => $failed_count,
+		'results'                => $results,
+		'message'                => $dry_run
+			? sprintf( 'Dry run found %d planned autoload change(s) across %d option(s); no state was changed.', $planned_count, count( $selection['option_names'] ) )
+			: sprintf( 'Changed autoload state for %d option(s); %d failed postcondition checks.', $changed_count, $failed_count ),
+	);
+}
+
+/**
  * Return one bounded, correlated database health snapshot.
  *
  * @return array<string, mixed>
@@ -1964,6 +2168,54 @@ function mcp_database_transient_cleanup_output_schema(): array {
 }
 
 /**
+ * Get the output schema for bounded option-autoload maintenance.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_option_autoload_output_schema(): array {
+	$nullable_string = array( 'type' => array( 'string', 'null' ) );
+	return array(
+		'type'                 => 'object',
+		'required'             => array( 'success', 'dry_run', 'confirmed', 'target_autoload', 'option_names', 'invalid_option_names', 'requested_count', 'planned_count', 'changed_count', 'unchanged_count', 'missing_count', 'failed_count', 'results', 'message' ),
+		'properties'           => array(
+			'success'              => array( 'type' => 'boolean' ),
+			'dry_run'              => array( 'type' => 'boolean' ),
+			'confirmed'            => array( 'type' => 'boolean' ),
+			'target_autoload'      => array( 'type' => 'boolean' ),
+			'option_names'         => array( 'type' => 'array', 'items' => array( 'type' => 'string' ) ),
+			'invalid_option_names' => array( 'type' => 'array', 'items' => array( 'type' => 'string' ) ),
+			'requested_count'      => array( 'type' => 'integer' ),
+			'planned_count'        => array( 'type' => 'integer' ),
+			'changed_count'        => array( 'type' => 'integer' ),
+			'unchanged_count'      => array( 'type' => 'integer' ),
+			'missing_count'        => array( 'type' => 'integer' ),
+			'failed_count'         => array( 'type' => 'integer' ),
+			'results'              => array(
+				'type'  => 'array',
+				'items' => array(
+					'type'                 => 'object',
+					'required'             => array( 'option_name', 'exists', 'value_bytes', 'before_autoload', 'after_autoload', 'planned', 'changed', 'success', 'error_code' ),
+					'properties'           => array(
+						'option_name'     => array( 'type' => 'string' ),
+						'exists'          => array( 'type' => 'boolean' ),
+						'value_bytes'     => array( 'type' => 'integer' ),
+						'before_autoload' => $nullable_string,
+						'after_autoload'  => $nullable_string,
+						'planned'         => array( 'type' => 'boolean' ),
+						'changed'         => array( 'type' => 'boolean' ),
+						'success'         => array( 'type' => 'boolean' ),
+						'error_code'      => $nullable_string,
+					),
+					'additionalProperties' => false,
+				),
+			),
+			'message'              => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+}
+
+/**
  * Get the output schema for the bounded database health snapshot.
  *
  * @return array<string, mixed>
@@ -2114,6 +2366,34 @@ function mcp_register_database_abilities(): void {
 					'idempotent'  => true,
 				),
 			),
+		)
+	);
+
+	wp_register_ability(
+		'database/set-option-autoload',
+		array(
+			'label'               => 'Set WordPress Option Autoload State',
+			'description'         => 'Plans or changes autoload state for 1–25 explicitly named non-transient options without reading or writing option values. Defaults to dry-run.',
+			'category'            => 'site',
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'required'             => array( 'option_names', 'autoload' ),
+				'properties'           => array(
+					'option_names' => array( 'type' => 'array', 'items' => array( 'type' => 'string', 'minLength' => 1, 'maxLength' => 191 ), 'minItems' => 1, 'maxItems' => 25, 'uniqueItems' => true ),
+					'autoload'     => array( 'type' => 'boolean' ),
+					'dry_run'      => array( 'type' => 'boolean', 'default' => true ),
+					'confirm'      => array( 'type' => 'boolean', 'default' => false ),
+				),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => mcp_database_option_autoload_output_schema(),
+			'execute_callback'    => static function ( array $input ): array {
+				return mcp_database_set_option_autoload( $input );
+			},
+			'permission_callback' => static function (): bool {
+				return current_user_can( 'manage_options' );
+			},
+			'meta'                => array( 'annotations' => array( 'readonly' => false, 'destructive' => true, 'idempotent' => true ) ),
 		)
 	);
 

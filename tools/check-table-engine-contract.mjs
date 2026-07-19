@@ -10,9 +10,9 @@ const wpRuntime = fs.readFileSync(path.join(root, 'tools', 'check-table-engine-w
 const gitAttributes = fs.readFileSync(path.join(root, '.gitattributes'), 'utf8');
 
 const assertions = [
-  [/Version: 0\.1\.4/, 'plugin header version is 0.1.4'],
-  [/Stable tag: 0\.1\.4/, 'WordPress readme stable tag is 0.1.4'],
-  [/\*\*Stable tag:\*\* 0\.1\.4/, 'GitHub README stable tag is 0.1.4'],
+  [/Version: 0\.1\.5/, 'plugin header version is 0.1.5'],
+  [/Stable tag: 0\.1\.5/, 'WordPress readme stable tag is 0.1.5'],
+  [/\*\*Stable tag:\*\* 0\.1\.5/, 'GitHub README stable tag is 0.1.5'],
   [/Author: basicus/, 'public plugin author identity is basicus'],
   [/Contributors: basicus/, 'WordPress contributor identity is basicus'],
   [/'database\/audit-core-table-engines'/, 'audit ability is registered'],

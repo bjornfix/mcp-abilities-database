@@ -4,7 +4,7 @@ Tags: mcp, abilities, database, maintenance
 Requires at least: 6.9
 Tested up to: 7.0
 Requires PHP: 8.0
-Stable tag: 0.1.4
+Stable tag: 0.1.5
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -25,10 +25,14 @@ Current abilities:
 * `database/audit-index-health` - paginated read-only index definitions and findings for the current site scope.
 * `database/audit-options-health` - bounded autoload, option-size, and expired-transient audit that never returns option values.
 * `database/cleanup-expired-transients` - dry-run-first, confirm-gated cleanup of at most 500 expired transient pairs per call without returning names or values.
+* `database/set-option-autoload` - dry-run-first, confirm-gated autoload maintenance for at most 25 explicit non-transient option names without reading or changing their values.
 
 Table-engine abilities accept logical WordPress table keys only. Physical names are resolved from WordPress, so custom prefixes and multisite base tables work without accepting arbitrary table names or SQL. On multisite, network-global table keys require super-admin and network-options authority, including audit and dry-run requests. Conversion responses report the database statement outcome, verified postcondition, and known or unknown mutation separately.
 
 == Changelog ==
+
+= 0.1.5 =
+* Add bounded option-autoload maintenance with explicit names, value-preserving WordPress core mutation, and verified before/after state.
 
 = 0.1.4 =
 * Add bounded expired-transient cleanup with dry-run planning, explicit confirmation, cache-safe WordPress option deletion, and before/after counts.

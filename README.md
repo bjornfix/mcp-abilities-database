@@ -8,7 +8,7 @@ Bounded database health diagnostics and controlled maintenance abilities for Wor
 [![PHP](https://img.shields.io/badge/PHP-8.0%2B-purple.svg)](https://php.net)
 
 **Tested up to:** 7.0
-**Stable tag:** 0.1.4
+**Stable tag:** 0.1.5
 **License:** GPLv2 or later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -118,15 +118,17 @@ If you skip base-stack verification and start with add-ons immediately, troubles
 - `database/audit-index-health`
 - `database/audit-options-health`
 - `database/cleanup-expired-transients`
+- `database/set-option-autoload`
 
 ## Safety Model
 
-Post-content abilities are scoped to selected post types/statuses. Table-engine abilities accept only fixed logical WordPress core table keys, resolve physical table names through WordPress, and never accept arbitrary SQL or table identifiers. The database-health module owns current-site table inventory, multisite scope, authorization, bounded pagination, and metadata interpretation behind one interface. Index audits never accept physical table or index names; options audits return names and byte counts only, never values. Expired-transient cleanup is capped at 500 timeout rows per call, defaults to dry-run, requires explicit confirmation for deletion, and never returns transient names or values. On multisite, schema discovery requires super-admin plus network-options authority because physical prefixes can overlap. Engine conversion defaults to dry-run, requires an explicit table list, and requires both `dry_run=false` and `confirm=true` for live DDL. Each result separates the reported database statement outcome, verified postcondition, and known or unknown mutation; aggregate partial state is nullable when the database effect cannot be proven.
+Post-content abilities are scoped to selected post types/statuses. Table-engine abilities accept only fixed logical WordPress core table keys, resolve physical table names through WordPress, and never accept arbitrary SQL or table identifiers. The database-health module owns current-site table inventory, multisite scope, authorization, bounded pagination, and metadata interpretation behind one interface. Index audits never accept physical table or index names; options audits return names and byte counts only, never values. Expired-transient cleanup is capped at 500 timeout rows per call, defaults to dry-run, requires explicit confirmation for deletion, and never returns transient names or values. Option-autoload maintenance accepts at most 25 explicit non-transient names, preserves option values, verifies the stored postcondition, and is also dry-run-first. On multisite, schema discovery requires super-admin plus network-options authority because physical prefixes can overlap. Engine conversion defaults to dry-run, requires an explicit table list, and requires both `dry_run=false` and `confirm=true` for live DDL. Each result separates the reported database statement outcome, verified postcondition, and known or unknown mutation; aggregate partial state is nullable when the database effect cannot be proven.
 
 ## Changelog
 
 ### Current
 
+- 0.1.5: Add bounded, value-preserving option-autoload maintenance for explicit option names.
 - 0.1.4: Add dry-run-first, confirm-gated cleanup of bounded expired transient batches without exposing names or values.
 - 0.1.3: Add the bounded database-health snapshot, paginated index health, options/autoload health, multisite-safe inventory, and null-input compatibility.
 - 0.1.2: Add allowlisted core table-engine audit and confirm-gated InnoDB conversion.
