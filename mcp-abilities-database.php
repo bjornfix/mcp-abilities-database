@@ -372,6 +372,7 @@ function mcp_database_expected_core_index_shapes(): array {
 			array( 'columns' => array( 'post_type', 'post_status', 'post_date', 'ID' ), 'unique' => false ),
 			array( 'columns' => array( 'post_parent' ), 'unique' => false ),
 			array( 'columns' => array( 'post_author' ), 'unique' => false ),
+			array( 'columns' => array( 'post_type', 'post_status', 'post_author' ), 'unique' => false ),
 		),
 		'postmeta' => array(
 			array( 'columns' => array( 'meta_id' ), 'unique' => true ),
@@ -421,7 +422,7 @@ function mcp_database_expected_core_index_shapes(): array {
 		),
 		'users' => array(
 			array( 'columns' => array( 'ID' ), 'unique' => true ),
-			array( 'columns' => array( 'user_login' ), 'unique' => true ),
+			array( 'columns' => array( 'user_login' ), 'unique' => false ),
 			array( 'columns' => array( 'user_nicename' ), 'unique' => false ),
 			array( 'columns' => array( 'user_email' ), 'unique' => false ),
 		),
@@ -531,6 +532,9 @@ function mcp_database_audit_index_health( array $input = array() ): array {
 			'engine_counts'            => array(),
 			'usage_counters_available' => false,
 			'issue_count'              => 1,
+			'issue_counts'             => array( 'table_metadata_query_failed' => 1 ),
+			'returned_issue_count'     => 1,
+			'issues_truncated'         => false,
 			'issues'                   => array( array( 'code' => 'table_metadata_query_failed', 'severity' => 'error', 'table_name' => '', 'index_name' => '', 'related_index_name' => '', 'message' => 'Database table metadata could not be read.' ) ),
 			'tables'                   => array(),
 			'message'                  => 'Index health audit could not read database table metadata.',
@@ -736,7 +740,25 @@ function mcp_database_audit_index_health( array $input = array() ): array {
 		$issues[] = array( 'code' => 'index_metadata_query_failed', 'severity' => 'error', 'table_name' => '', 'index_name' => '', 'related_index_name' => '', 'message' => 'Database index metadata could not be read.' );
 	}
 
-	$results     = array_slice( $results, $offset, $limit );
+	$issue_counts = array();
+	foreach ( $issues as $issue ) {
+		$code = sanitize_key( (string) ( $issue['code'] ?? '' ) );
+		if ( '' !== $code ) {
+			$issue_counts[ $code ] = (int) ( $issue_counts[ $code ] ?? 0 ) + 1;
+		}
+	}
+	$total_issue_count = count( $issues );
+	$results           = array_slice( $results, $offset, $limit );
+	$returned_tables   = array_fill_keys( array_map( static fn( array $row ): string => (string) $row['table_name'], $results ), true );
+	$issues            = array_values(
+		array_filter(
+			$issues,
+			static function ( array $issue ) use ( $returned_tables ): bool {
+				$table_name = (string) ( $issue['table_name'] ?? '' );
+				return '' === $table_name || isset( $returned_tables[ $table_name ] );
+			}
+		)
+	);
 	$next_offset = $offset + count( $results ) < $total_table_count ? $offset + count( $results ) : null;
 
 	return array(
@@ -755,10 +777,13 @@ function mcp_database_audit_index_health( array $input = array() ): array {
 		'total_free_bytes'         => $total_free_bytes,
 		'engine_counts'            => $engine_counts,
 		'usage_counters_available' => $usage_available,
-		'issue_count'              => count( $issues ),
+		'issue_count'              => $total_issue_count,
+		'issue_counts'             => $issue_counts,
+		'returned_issue_count'     => count( $issues ),
+		'issues_truncated'         => count( $issues ) < $total_issue_count,
 		'issues'                   => $issues,
 		'tables'                   => $results,
-		'message'                  => sprintf( 'Audited %d site-prefixed tables and their index metadata; found %d issue or review item(s).', count( $results ), count( $issues ) ),
+		'message'                  => sprintf( 'Audited %d site-prefixed tables and their index metadata; found %d issue or review item(s) across the full scope.', count( $results ), $total_issue_count ),
 	);
 }
 
@@ -869,13 +894,7 @@ function mcp_database_audit_options_health( array $input = array() ): array {
 function mcp_database_audit_health(): array {
 	$index_health   = mcp_database_audit_index_health( array( 'limit' => 1, 'offset' => 0 ) );
 	$options_health = mcp_database_audit_options_health( array( 'limit' => 5 ) );
-	$issue_counts   = array();
-	foreach ( (array) ( $index_health['issues'] ?? array() ) as $issue ) {
-		$code = sanitize_key( (string) ( $issue['code'] ?? '' ) );
-		if ( '' !== $code ) {
-			$issue_counts[ $code ] = (int) ( $issue_counts[ $code ] ?? 0 ) + 1;
-		}
-	}
+	$issue_counts   = (array) ( $index_health['issue_counts'] ?? array() );
 
 	return array(
 		'success'     => ! empty( $index_health['success'] ) && ! empty( $options_health['success'] ),
@@ -1697,7 +1716,7 @@ function mcp_database_index_health_output_schema(): array {
 
 	return array(
 		'type'                 => 'object',
-		'required'             => array( 'success', 'observed_at', 'scope', 'table_prefix', 'total_table_count', 'returned_table_count', 'table_count', 'limit', 'offset', 'next_offset', 'total_data_bytes', 'total_index_bytes', 'total_free_bytes', 'engine_counts', 'usage_counters_available', 'issue_count', 'issues', 'tables', 'message' ),
+		'required'             => array( 'success', 'observed_at', 'scope', 'table_prefix', 'total_table_count', 'returned_table_count', 'table_count', 'limit', 'offset', 'next_offset', 'total_data_bytes', 'total_index_bytes', 'total_free_bytes', 'engine_counts', 'usage_counters_available', 'issue_count', 'issue_counts', 'returned_issue_count', 'issues_truncated', 'issues', 'tables', 'message' ),
 		'properties'           => array(
 			'success'                  => array( 'type' => 'boolean' ),
 			'observed_at'              => array( 'type' => 'string' ),
@@ -1715,6 +1734,9 @@ function mcp_database_index_health_output_schema(): array {
 			'engine_counts'            => array( 'type' => 'object', 'additionalProperties' => array( 'type' => 'integer' ) ),
 			'usage_counters_available' => array( 'type' => 'boolean' ),
 			'issue_count'              => array( 'type' => 'integer' ),
+			'issue_counts'             => array( 'type' => 'object', 'additionalProperties' => array( 'type' => 'integer' ) ),
+			'returned_issue_count'     => array( 'type' => 'integer' ),
+			'issues_truncated'         => array( 'type' => 'boolean' ),
 			'issues'                   => array( 'type' => 'array', 'items' => $issue_schema ),
 			'tables'                   => array( 'type' => 'array', 'items' => $table_schema ),
 			'message'                  => array( 'type' => 'string' ),

@@ -108,6 +108,7 @@ $test_is_multisite = true;
 $audit = mcp_database_audit_index_health( array( 'limit' => 1 ) );
 assert_true( 1 === $audit['total_table_count'] && 'wp_custom' === $audit['tables'][0]['table_name'], 'Main-site scope must exclude sibling multisite tables.' );
 assert_true( 1 === $audit['issue_count'] && 'duplicate_index_left_prefix' === $audit['issues'][0]['code'], 'Left-prefix review finding must be deterministic.' );
+assert_true( 1 === $audit['returned_issue_count'] && false === $audit['issues_truncated'] && 1 === $audit['issue_counts']['duplicate_index_left_prefix'], 'Issue totals and bounded details must agree.' );
 assert_true( null === $audit['next_offset'] && false === $audit['usage_counters_available'], 'Pagination and unavailable usage evidence must be explicit.' );
 ++ $scenarios;
 
