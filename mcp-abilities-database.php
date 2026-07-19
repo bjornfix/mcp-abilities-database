@@ -805,12 +805,22 @@ function mcp_database_audit_options_health( array $input = array() ): array {
 	$summary = $wpdb->get_row(
 		$wpdb->prepare(
 			"SELECT COUNT(*) AS option_count, COALESCE(SUM(OCTET_LENGTH(option_value)), 0) AS total_value_bytes, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) THEN 1 ELSE 0 END), 0) AS autoload_count, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) THEN OCTET_LENGTH(option_value) ELSE 0 END), 0) AS autoload_bytes, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) AND OCTET_LENGTH(option_value) >= 262144 THEN 1 ELSE 0 END), 0) AS oversized_autoload_count, COALESCE(SUM(CASE WHEN option_name LIKE %s THEN 1 ELSE 0 END), 0) AS transient_row_count, COALESCE(SUM(CASE WHEN option_name LIKE %s AND CAST(option_value AS UNSIGNED) > 0 AND CAST(option_value AS UNSIGNED) < %d THEN 1 ELSE 0 END), 0) AS expired_transient_count FROM %i",
-			...array_merge(
-				$autoload_values,
-				$autoload_values,
-				$autoload_values,
-				array( $wpdb->esc_like( '_transient_' ) . '%', $wpdb->esc_like( '_transient_timeout_' ) . '%', $now, $wpdb->options )
-			)
+			$autoload_values[0],
+			$autoload_values[1],
+			$autoload_values[2],
+			$autoload_values[3],
+			$autoload_values[0],
+			$autoload_values[1],
+			$autoload_values[2],
+			$autoload_values[3],
+			$autoload_values[0],
+			$autoload_values[1],
+			$autoload_values[2],
+			$autoload_values[3],
+			$wpdb->esc_like( '_transient_' ) . '%',
+			$wpdb->esc_like( '_transient_timeout_' ) . '%',
+			$now,
+			$wpdb->options
 		),
 		ARRAY_A
 	);
@@ -840,7 +850,12 @@ function mcp_database_audit_options_health( array $input = array() ): array {
 	$top_rows = $wpdb->get_results(
 		$wpdb->prepare(
 			"SELECT option_name, autoload, OCTET_LENGTH(option_value) AS value_bytes FROM %i WHERE autoload IN (%s, %s, %s, %s) ORDER BY value_bytes DESC, option_name ASC LIMIT %d",
-			...array_merge( array( $wpdb->options ), $autoload_values, array( $limit ) )
+			$wpdb->options,
+			$autoload_values[0],
+			$autoload_values[1],
+			$autoload_values[2],
+			$autoload_values[3],
+			$limit
 		),
 		ARRAY_A
 	);
