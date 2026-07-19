@@ -1,6 +1,6 @@
 # MCP Abilities - Database
 
-Controlled database maintenance abilities for MCP. Provides confirm-gated search/replace for WordPress post content.
+Bounded database health diagnostics and controlled maintenance abilities for WordPress through MCP.
 
 [![GitHub release](https://img.shields.io/github/v/release/bjornfix/mcp-abilities-database)](https://github.com/bjornfix/mcp-abilities-database/releases)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/gpl-2.0)
@@ -14,11 +14,11 @@ Controlled database maintenance abilities for MCP. Provides confirm-gated search
 
 ## What It Does
 
-Controlled database maintenance abilities for MCP. Provides confirm-gated search/replace for WordPress post content.
+Inspect storage engines, index health, table size, autoloaded options, and expired transients through bounded read-only abilities. The plugin also provides tightly scoped, confirm-gated maintenance tools for post content and allowlisted WordPress core tables.
 
-This plugin is part of the Devenia MCP abilities ecosystem. It gives an MCP-capable agent a focused, authenticated way to work with Database work inside WordPress through MCP.
+This plugin is part of the Devenia MCP abilities ecosystem. It gives an MCP-capable agent a focused, authenticated way to inspect database health and perform explicitly approved maintenance inside WordPress.
 
-**Example:** "Handle this WordPress maintenance task directly." - The agent can inspect the site, call the relevant ability, and return the result without making the human click through wp-admin for every step.
+**Example:** "Check this WordPress database, especially its indexes." The agent can return a bounded health snapshot, identify review candidates, and keep diagnostic work separate from any later mutation approval.
 
 ## The Real Workflow
 
@@ -86,7 +86,7 @@ It is especially useful when the manual version is repetitive enough that import
 Start with the main plugin page and base stack documentation:
 
 - [MCP Expose Abilities](https://devenia.com/plugins/mcp-expose-abilities/)
-- [Plugin Page](https://devenia.com/plugins/mcp-expose-abilities/#add-ons)
+- [MCP Abilities – Database](https://devenia.com/plugins/mcp-abilities-database/)
 - [Getting Started](https://github.com/bjornfix/mcp-expose-abilities/wiki/Getting-Started)
 - [Install Order and Dependencies](https://github.com/bjornfix/mcp-expose-abilities/wiki/Install-Order-and-Dependencies)
 
@@ -145,8 +145,9 @@ GPL-2.0+
 
 ## Links
 
-- [Plugin Page](https://devenia.com/plugins/mcp-expose-abilities/#add-ons)
+- [Plugin Page](https://devenia.com/plugins/mcp-abilities-database/)
 - [MCP Expose Abilities](https://devenia.com/plugins/mcp-expose-abilities/)
+- [Download](https://downloads.devenia.com/mcp-abilities-database.zip)
 - [GitHub Releases](https://github.com/bjornfix/mcp-abilities-database/releases)
 
 ## Star and Share
