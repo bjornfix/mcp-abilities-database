@@ -8,7 +8,7 @@ Controlled database maintenance abilities for MCP. Provides confirm-gated search
 [![PHP](https://img.shields.io/badge/PHP-8.0%2B-purple.svg)](https://php.net)
 
 **Tested up to:** 7.0
-**Stable tag:** 0.1.2
+**Stable tag:** 0.1.3
 **License:** GPLv2 or later
 **License URI:** https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -114,15 +114,19 @@ If you skip base-stack verification and start with add-ons immediately, troubles
 - `database/regex-replace-post-content`
 - `database/audit-core-table-engines`
 - `database/convert-core-tables-to-innodb`
+- `database/audit-health`
+- `database/audit-index-health`
+- `database/audit-options-health`
 
 ## Safety Model
 
-Post-content abilities are scoped to selected post types/statuses. Table-engine abilities accept only fixed logical WordPress core table keys, resolve physical table names through WordPress, and never accept arbitrary SQL or table identifiers. On multisite, network-global table keys require super-admin status plus network-options authority for audit, dry-run, and live requests. Engine conversion defaults to dry-run, requires an explicit table list, and requires both `dry_run=false` and `confirm=true` for live DDL. Each result separates the reported database statement outcome, verified postcondition, and known or unknown mutation; aggregate partial state is nullable when the database effect cannot be proven.
+Post-content abilities are scoped to selected post types/statuses. Table-engine abilities accept only fixed logical WordPress core table keys, resolve physical table names through WordPress, and never accept arbitrary SQL or table identifiers. The database-health module owns current-site table inventory, multisite scope, authorization, bounded pagination, and metadata interpretation behind one interface. Index audits never accept physical table or index names; options audits return names and byte counts only, never values. On multisite, schema discovery requires super-admin plus network-options authority because physical prefixes can overlap. Engine conversion defaults to dry-run, requires an explicit table list, and requires both `dry_run=false` and `confirm=true` for live DDL. Each result separates the reported database statement outcome, verified postcondition, and known or unknown mutation; aggregate partial state is nullable when the database effect cannot be proven.
 
 ## Changelog
 
 ### Current
 
+- 0.1.3: Add the bounded database-health snapshot, paginated index health, options/autoload health, multisite-safe inventory, and null-input compatibility.
 - 0.1.2: Add allowlisted core table-engine audit and confirm-gated InnoDB conversion.
 - 0.1.1: Add read-only post content match listing for exact maintenance queues.
 - Documentation aligned with the public plugin README standard.

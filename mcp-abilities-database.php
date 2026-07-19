@@ -2,8 +2,8 @@
 /**
  * Plugin Name: MCP Abilities - Database
  * Plugin URI: https://devenia.com
- * Description: Controlled database maintenance abilities for MCP, including post-content maintenance and WordPress core table-engine audits.
- * Version: 0.1.2
+ * Description: Controlled database maintenance abilities for MCP, including post-content maintenance and WordPress database health audits.
+ * Version: 0.1.3
  * Author: basicus
  * Author URI: https://profiles.wordpress.org/basicus/
  * License: GPL-2.0+
@@ -352,6 +352,563 @@ function mcp_database_audit_core_table_engines( array $input ): array {
 		'missing_count'    => $missing_count,
 		'results'          => $results,
 		'message'          => sprintf( 'Audited %d allowlisted WordPress core tables: %d InnoDB, %d other engines, %d unavailable or missing.', count( $results ), $innodb_count, $non_innodb_count, $missing_count ),
+	);
+}
+
+/**
+ * Expected index shapes for WordPress core tables.
+ *
+ * Index names are deliberately ignored. WordPress installations may retain a
+ * valid equivalent index under a different name, while the ordered columns and
+ * uniqueness are what determine whether the expected lookup path exists.
+ *
+ * @return array<string, array<int, array{columns: string[], unique: bool}>>
+ */
+function mcp_database_expected_core_index_shapes(): array {
+	return array(
+		'posts' => array(
+			array( 'columns' => array( 'ID' ), 'unique' => true ),
+			array( 'columns' => array( 'post_name' ), 'unique' => false ),
+			array( 'columns' => array( 'post_type', 'post_status', 'post_date', 'ID' ), 'unique' => false ),
+			array( 'columns' => array( 'post_parent' ), 'unique' => false ),
+			array( 'columns' => array( 'post_author' ), 'unique' => false ),
+		),
+		'postmeta' => array(
+			array( 'columns' => array( 'meta_id' ), 'unique' => true ),
+			array( 'columns' => array( 'post_id' ), 'unique' => false ),
+			array( 'columns' => array( 'meta_key' ), 'unique' => false ),
+		),
+		'comments' => array(
+			array( 'columns' => array( 'comment_ID' ), 'unique' => true ),
+			array( 'columns' => array( 'comment_post_ID' ), 'unique' => false ),
+			array( 'columns' => array( 'comment_approved', 'comment_date_gmt' ), 'unique' => false ),
+			array( 'columns' => array( 'comment_date_gmt' ), 'unique' => false ),
+			array( 'columns' => array( 'comment_parent' ), 'unique' => false ),
+			array( 'columns' => array( 'comment_author_email' ), 'unique' => false ),
+		),
+		'commentmeta' => array(
+			array( 'columns' => array( 'meta_id' ), 'unique' => true ),
+			array( 'columns' => array( 'comment_id' ), 'unique' => false ),
+			array( 'columns' => array( 'meta_key' ), 'unique' => false ),
+		),
+		'terms' => array(
+			array( 'columns' => array( 'term_id' ), 'unique' => true ),
+			array( 'columns' => array( 'slug' ), 'unique' => false ),
+			array( 'columns' => array( 'name' ), 'unique' => false ),
+		),
+		'termmeta' => array(
+			array( 'columns' => array( 'meta_id' ), 'unique' => true ),
+			array( 'columns' => array( 'term_id' ), 'unique' => false ),
+			array( 'columns' => array( 'meta_key' ), 'unique' => false ),
+		),
+		'term_taxonomy' => array(
+			array( 'columns' => array( 'term_taxonomy_id' ), 'unique' => true ),
+			array( 'columns' => array( 'term_id', 'taxonomy' ), 'unique' => true ),
+			array( 'columns' => array( 'taxonomy' ), 'unique' => false ),
+		),
+		'term_relationships' => array(
+			array( 'columns' => array( 'object_id', 'term_taxonomy_id' ), 'unique' => true ),
+			array( 'columns' => array( 'term_taxonomy_id' ), 'unique' => false ),
+		),
+		'options' => array(
+			array( 'columns' => array( 'option_id' ), 'unique' => true ),
+			array( 'columns' => array( 'option_name' ), 'unique' => true ),
+			array( 'columns' => array( 'autoload' ), 'unique' => false ),
+		),
+		'links' => array(
+			array( 'columns' => array( 'link_id' ), 'unique' => true ),
+			array( 'columns' => array( 'link_visible' ), 'unique' => false ),
+		),
+		'users' => array(
+			array( 'columns' => array( 'ID' ), 'unique' => true ),
+			array( 'columns' => array( 'user_login' ), 'unique' => true ),
+			array( 'columns' => array( 'user_nicename' ), 'unique' => false ),
+			array( 'columns' => array( 'user_email' ), 'unique' => false ),
+		),
+		'usermeta' => array(
+			array( 'columns' => array( 'umeta_id' ), 'unique' => true ),
+			array( 'columns' => array( 'user_id' ), 'unique' => false ),
+			array( 'columns' => array( 'meta_key' ), 'unique' => false ),
+		),
+	);
+}
+
+/**
+ * Whether one ordered column list is a left prefix of another.
+ *
+ * @param string[] $candidate Possible prefix.
+ * @param string[] $covering Possible covering list.
+ */
+function mcp_database_index_columns_are_left_prefix( array $candidate, array $covering ): bool {
+	if ( empty( $candidate ) || count( $candidate ) >= count( $covering ) ) {
+		return false;
+	}
+
+	return $candidate === array_slice( $covering, 0, count( $candidate ) );
+}
+
+/**
+ * Authorize site-table metadata inspection.
+ *
+ * A single-site administrator owns the whole installation schema. On
+ * multisite, even a site-local prefix can overlap network-global or sibling
+ * blog table names, so schema discovery additionally requires network-level
+ * authority.
+ */
+function mcp_database_can_audit_index_health(): bool {
+	if ( ! current_user_can( 'manage_options' ) ) {
+		return false;
+	}
+
+	return ! is_multisite() || ( is_super_admin() && current_user_can( 'manage_network_options' ) );
+}
+
+/**
+ * Whether a discovered physical table belongs to the current site scope.
+ *
+ * On a multisite main site, wp_ must not absorb sibling tables such as wp_2_*.
+ * Global core tables remain in scope only for a network-authorized caller.
+ */
+function mcp_database_is_current_site_table( string $table_name ): bool {
+	global $wpdb;
+
+	if ( '' === $table_name || ! str_starts_with( $table_name, $wpdb->prefix ) ) {
+		return false;
+	}
+
+	if ( is_multisite() && $wpdb->prefix === $wpdb->base_prefix ) {
+		$sibling_pattern = '/^' . preg_quote( $wpdb->base_prefix, '/' ) . '[0-9]+_/';
+		if ( 1 === preg_match( $sibling_pattern, $table_name ) ) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/**
+ * Audit index metadata for every physical table owned by the current site prefix.
+ *
+ * No row values, arbitrary identifiers, or caller-supplied SQL are accepted or
+ * returned. Performance Schema usage counters are observations since the last
+ * server reset, not proof that an index is safe to remove.
+ *
+ * @param array<string, mixed> $input Bounded pagination input.
+ * @return array<string, mixed>
+ */
+function mcp_database_audit_index_health( array $input = array() ): array {
+	global $wpdb;
+
+	$limit  = max( 1, min( 100, (int) ( $input['limit'] ?? 25 ) ) );
+	$offset = max( 0, (int) ( $input['offset'] ?? 0 ) );
+	$table_pattern = $wpdb->esc_like( $wpdb->prefix ) . '%';
+	$wpdb->last_error = '';
+	// Current physical metadata cannot be served from WordPress object cache.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$table_rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT TABLE_NAME AS table_name, ENGINE AS engine, TABLE_TYPE AS table_type, ROW_FORMAT AS row_format, TABLE_COLLATION AS table_collation, TABLE_ROWS AS rows_estimate, DATA_LENGTH AS data_bytes, INDEX_LENGTH AS index_bytes, DATA_FREE AS data_free_bytes FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s ORDER BY TABLE_NAME",
+			$table_pattern
+		),
+		ARRAY_A
+	);
+
+	if ( '' !== $wpdb->last_error || ! is_array( $table_rows ) ) {
+		return array(
+			'success'                  => false,
+			'observed_at'              => gmdate( 'c' ),
+			'scope'                    => 'current_site',
+			'table_prefix'             => $wpdb->prefix,
+			'total_table_count'        => 0,
+			'returned_table_count'     => 0,
+			'table_count'              => 0,
+			'limit'                    => $limit,
+			'offset'                   => $offset,
+			'next_offset'              => null,
+			'total_data_bytes'         => 0,
+			'total_index_bytes'        => 0,
+			'total_free_bytes'         => 0,
+			'engine_counts'            => array(),
+			'usage_counters_available' => false,
+			'issue_count'              => 1,
+			'issues'                   => array( array( 'code' => 'table_metadata_query_failed', 'severity' => 'error', 'table_name' => '', 'index_name' => '', 'related_index_name' => '', 'message' => 'Database table metadata could not be read.' ) ),
+			'tables'                   => array(),
+			'message'                  => 'Index health audit could not read database table metadata.',
+		);
+	}
+	$table_rows = array_values(
+		array_filter(
+			$table_rows,
+			static fn( array $row ): bool => mcp_database_is_current_site_table( (string) ( $row['table_name'] ?? '' ) )
+		)
+	);
+	$total_table_count = count( $table_rows );
+	$allowed_table_names = array_fill_keys( array_map( static fn( array $row ): string => (string) $row['table_name'], $table_rows ), true );
+
+	$wpdb->last_error = '';
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$index_rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT TABLE_NAME AS table_name, INDEX_NAME AS index_name, NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index, COLUMN_NAME AS column_name, SUB_PART AS sub_part, CARDINALITY AS cardinality, INDEX_TYPE AS index_type FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+			$table_pattern
+		),
+		ARRAY_A
+	);
+	$index_query_failed = '' !== $wpdb->last_error || ! is_array( $index_rows );
+	if ( $index_query_failed ) {
+		$index_rows = array();
+	} else {
+		$index_rows = array_values(
+			array_filter(
+				$index_rows,
+				static fn( array $row ): bool => isset( $allowed_table_names[ (string) ( $row['table_name'] ?? '' ) ] )
+			)
+		);
+	}
+
+	$wpdb->last_error = '';
+	// These counters may be unavailable when Performance Schema is disabled or access is restricted.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$usage_rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT OBJECT_NAME AS table_name, INDEX_NAME AS index_name, COUNT_READ AS count_read, COUNT_WRITE AS count_write, COUNT_FETCH AS count_fetch FROM performance_schema.table_io_waits_summary_by_index_usage WHERE OBJECT_SCHEMA = DATABASE() AND OBJECT_NAME LIKE %s",
+			$table_pattern
+		),
+		ARRAY_A
+	);
+	$usage_available = '' === $wpdb->last_error && is_array( $usage_rows ) && ! empty( $usage_rows );
+	$usage_map       = array();
+	if ( $usage_available ) {
+		foreach ( $usage_rows as $usage_row ) {
+			$table_name = (string) ( $usage_row['table_name'] ?? '' );
+			$index_name = (string) ( $usage_row['index_name'] ?? '' );
+			if ( isset( $allowed_table_names[ $table_name ] ) && '' !== $index_name ) {
+				$usage_map[ $table_name ][ $index_name ] = array(
+					'count_read'  => (int) ( $usage_row['count_read'] ?? 0 ),
+					'count_write' => (int) ( $usage_row['count_write'] ?? 0 ),
+					'count_fetch' => (int) ( $usage_row['count_fetch'] ?? 0 ),
+				);
+			}
+		}
+	}
+
+	$indexes_by_table = array();
+	foreach ( $index_rows as $row ) {
+		$table_name = (string) ( $row['table_name'] ?? '' );
+		$index_name = (string) ( $row['index_name'] ?? '' );
+		$column_name = (string) ( $row['column_name'] ?? '' );
+		if ( '' === $table_name || '' === $index_name || '' === $column_name ) {
+			continue;
+		}
+		if ( ! isset( $indexes_by_table[ $table_name ][ $index_name ] ) ) {
+			$indexes_by_table[ $table_name ][ $index_name ] = array(
+				'name'        => $index_name,
+				'unique'      => 0 === (int) ( $row['non_unique'] ?? 1 ),
+				'primary'     => 'PRIMARY' === $index_name,
+				'type'        => (string) ( $row['index_type'] ?? '' ),
+				'columns'     => array(),
+				'cardinality' => 0,
+				'count_read'  => null,
+				'count_write' => null,
+				'count_fetch' => null,
+			);
+		}
+		$sub_part = isset( $row['sub_part'] ) ? (int) $row['sub_part'] : 0;
+		$indexes_by_table[ $table_name ][ $index_name ]['columns'][] = $column_name . ( $sub_part > 0 ? '(' . $sub_part . ')' : '' );
+		$indexes_by_table[ $table_name ][ $index_name ]['cardinality'] = max(
+			(int) $indexes_by_table[ $table_name ][ $index_name ]['cardinality'],
+			(int) ( $row['cardinality'] ?? 0 )
+		);
+	}
+
+	foreach ( $indexes_by_table as $table_name => &$table_indexes ) {
+		foreach ( $table_indexes as $index_name => &$index ) {
+			if ( isset( $usage_map[ $table_name ][ $index_name ] ) ) {
+				$index['count_read']  = $usage_map[ $table_name ][ $index_name ]['count_read'];
+				$index['count_write'] = $usage_map[ $table_name ][ $index_name ]['count_write'];
+				$index['count_fetch'] = $usage_map[ $table_name ][ $index_name ]['count_fetch'];
+			}
+		}
+		unset( $index );
+	}
+	unset( $table_indexes );
+
+	$issues            = array();
+	$results           = array();
+	$total_data_bytes  = 0;
+	$total_index_bytes = 0;
+	$total_free_bytes  = 0;
+	$engine_counts     = array();
+	$core_shapes       = mcp_database_expected_core_index_shapes();
+	$core_names        = array();
+	foreach ( array_keys( $core_shapes ) as $table_key ) {
+		$table_name = mcp_database_resolve_core_table_name( $table_key );
+		if ( null !== $table_name ) {
+			$core_names[ $table_name ] = $table_key;
+		}
+	}
+
+	foreach ( $table_rows as $table_row ) {
+		$table_name  = (string) ( $table_row['table_name'] ?? '' );
+		$table_indexes = array_values( $indexes_by_table[ $table_name ] ?? array() );
+		$data_bytes  = (int) ( $table_row['data_bytes'] ?? 0 );
+		$index_bytes = (int) ( $table_row['index_bytes'] ?? 0 );
+		$free_bytes  = (int) ( $table_row['data_free_bytes'] ?? 0 );
+		$total_data_bytes  += $data_bytes;
+		$total_index_bytes += $index_bytes;
+		$total_free_bytes  += $free_bytes;
+		$engine_key = strtoupper( (string) ( $table_row['engine'] ?? 'UNKNOWN' ) );
+		$engine_key = '' !== $engine_key ? $engine_key : 'UNKNOWN';
+		$engine_counts[ $engine_key ] = (int) ( $engine_counts[ $engine_key ] ?? 0 ) + 1;
+
+		$duplicate_count = 0;
+		for ( $left = 0; $left < count( $table_indexes ); ++$left ) {
+			for ( $right = $left + 1; $right < count( $table_indexes ); ++$right ) {
+				$first  = $table_indexes[ $left ];
+				$second = $table_indexes[ $right ];
+				if ( 'BTREE' !== strtoupper( (string) $first['type'] ) || 'BTREE' !== strtoupper( (string) $second['type'] ) ) {
+					continue;
+				}
+				if ( $first['columns'] === $second['columns'] && $first['unique'] === $second['unique'] ) {
+					++$duplicate_count;
+					$issues[] = array( 'code' => 'duplicate_index_exact', 'severity' => 'warning', 'table_name' => $table_name, 'index_name' => (string) $second['name'], 'related_index_name' => (string) $first['name'], 'message' => 'Two indexes have the same ordered columns and uniqueness.' );
+					continue;
+				}
+				if ( empty( $first['unique'] ) && empty( $second['unique'] ) ) {
+					if ( mcp_database_index_columns_are_left_prefix( $first['columns'], $second['columns'] ) ) {
+						++$duplicate_count;
+						$issues[] = array( 'code' => 'duplicate_index_left_prefix', 'severity' => 'review', 'table_name' => $table_name, 'index_name' => (string) $first['name'], 'related_index_name' => (string) $second['name'], 'message' => 'A non-unique BTREE index is the left prefix of another index; review workload evidence before removal.' );
+					} elseif ( mcp_database_index_columns_are_left_prefix( $second['columns'], $first['columns'] ) ) {
+						++$duplicate_count;
+						$issues[] = array( 'code' => 'duplicate_index_left_prefix', 'severity' => 'review', 'table_name' => $table_name, 'index_name' => (string) $second['name'], 'related_index_name' => (string) $first['name'], 'message' => 'A non-unique BTREE index is the left prefix of another index; review workload evidence before removal.' );
+					}
+				}
+			}
+		}
+
+		$has_primary = false;
+		$unused_count = 0;
+		foreach ( $table_indexes as $index ) {
+			$has_primary = $has_primary || ! empty( $index['primary'] );
+			if ( $usage_available && empty( $index['primary'] ) && 0 === (int) $index['count_read'] ) {
+				++$unused_count;
+			}
+		}
+		if ( 'BASE TABLE' === (string) ( $table_row['table_type'] ?? '' ) && ! $has_primary ) {
+			$issues[] = array( 'code' => 'missing_primary_key', 'severity' => 'warning', 'table_name' => $table_name, 'index_name' => '', 'related_index_name' => '', 'message' => 'Base table has no primary key.' );
+		}
+
+		if ( isset( $core_names[ $table_name ] ) ) {
+			$table_key = $core_names[ $table_name ];
+			foreach ( $core_shapes[ $table_key ] as $expected ) {
+				$matched = false;
+				foreach ( $table_indexes as $actual ) {
+					$actual_columns = array_map( static fn( string $column ): string => (string) preg_replace( '/\([0-9]+\)$/', '', $column ), $actual['columns'] );
+					if ( $actual_columns === $expected['columns'] && ( ! $expected['unique'] || ! empty( $actual['unique'] ) ) ) {
+						$matched = true;
+						break;
+					}
+				}
+				if ( ! $matched ) {
+					$issues[] = array( 'code' => 'missing_core_index_shape', 'severity' => 'error', 'table_name' => $table_name, 'index_name' => implode( ',', $expected['columns'] ), 'related_index_name' => '', 'message' => 'A WordPress core index shape is missing.' );
+				}
+			}
+		}
+
+		$results[] = array(
+			'table_name'               => $table_name,
+			'engine'                   => isset( $table_row['engine'] ) ? (string) $table_row['engine'] : null,
+			'row_format'               => isset( $table_row['row_format'] ) ? (string) $table_row['row_format'] : null,
+			'collation'                => isset( $table_row['table_collation'] ) ? (string) $table_row['table_collation'] : null,
+			'rows_estimate'            => isset( $table_row['rows_estimate'] ) ? (int) $table_row['rows_estimate'] : null,
+			'data_bytes'               => $data_bytes,
+			'index_bytes'              => $index_bytes,
+			'data_free_bytes'          => $free_bytes,
+			'index_count'              => count( $table_indexes ),
+			'has_primary_key'          => $has_primary,
+			'duplicate_candidate_count'=> $duplicate_count,
+			'unused_observation_count' => $unused_count,
+			'indexes'                  => $table_indexes,
+		);
+	}
+
+	if ( $index_query_failed ) {
+		$issues[] = array( 'code' => 'index_metadata_query_failed', 'severity' => 'error', 'table_name' => '', 'index_name' => '', 'related_index_name' => '', 'message' => 'Database index metadata could not be read.' );
+	}
+
+	$results     = array_slice( $results, $offset, $limit );
+	$next_offset = $offset + count( $results ) < $total_table_count ? $offset + count( $results ) : null;
+
+	return array(
+		'success'                  => ! $index_query_failed,
+		'observed_at'              => gmdate( 'c' ),
+		'scope'                    => 'current_site',
+		'table_prefix'             => $wpdb->prefix,
+		'total_table_count'        => $total_table_count,
+		'returned_table_count'     => count( $results ),
+		'table_count'              => count( $results ),
+		'limit'                    => $limit,
+		'offset'                   => $offset,
+		'next_offset'              => $next_offset,
+		'total_data_bytes'         => $total_data_bytes,
+		'total_index_bytes'        => $total_index_bytes,
+		'total_free_bytes'         => $total_free_bytes,
+		'engine_counts'            => $engine_counts,
+		'usage_counters_available' => $usage_available,
+		'issue_count'              => count( $issues ),
+		'issues'                   => $issues,
+		'tables'                   => $results,
+		'message'                  => sprintf( 'Audited %d site-prefixed tables and their index metadata; found %d issue or review item(s).', count( $results ), count( $issues ) ),
+	);
+}
+
+/**
+ * Audit bounded wp_options health without returning option values.
+ *
+ * @param array<string, mixed> $input Bounded detail input.
+ * @return array<string, mixed>
+ */
+function mcp_database_audit_options_health( array $input = array() ): array {
+	global $wpdb;
+
+	$limit           = max( 1, min( 50, (int) ( $input['limit'] ?? 10 ) ) );
+	$autoload_values = array( 'yes', 'on', 'auto', 'auto-on' );
+	$now             = time();
+	$wpdb->last_error = '';
+	// Fixed aggregate query over the exact WordPress options table; values are measured, never returned.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$summary = $wpdb->get_row(
+		$wpdb->prepare(
+			"SELECT COUNT(*) AS option_count, COALESCE(SUM(OCTET_LENGTH(option_value)), 0) AS total_value_bytes, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) THEN 1 ELSE 0 END), 0) AS autoload_count, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) THEN OCTET_LENGTH(option_value) ELSE 0 END), 0) AS autoload_bytes, COALESCE(SUM(CASE WHEN autoload IN (%s, %s, %s, %s) AND OCTET_LENGTH(option_value) >= 262144 THEN 1 ELSE 0 END), 0) AS oversized_autoload_count, COALESCE(SUM(CASE WHEN option_name LIKE %s THEN 1 ELSE 0 END), 0) AS transient_row_count, COALESCE(SUM(CASE WHEN option_name LIKE %s AND CAST(option_value AS UNSIGNED) > 0 AND CAST(option_value AS UNSIGNED) < %d THEN 1 ELSE 0 END), 0) AS expired_transient_count FROM %i",
+			...array_merge(
+				$autoload_values,
+				$autoload_values,
+				$autoload_values,
+				array( $wpdb->esc_like( '_transient_' ) . '%', $wpdb->esc_like( '_transient_timeout_' ) . '%', $now, $wpdb->options )
+			)
+		),
+		ARRAY_A
+	);
+
+	if ( '' !== $wpdb->last_error || ! is_array( $summary ) ) {
+		return array(
+			'success'                  => false,
+			'observed_at'              => gmdate( 'c' ),
+			'option_count'             => 0,
+			'total_value_bytes'        => 0,
+			'autoload_count'           => 0,
+			'autoload_bytes'           => 0,
+			'oversized_autoload_count' => 0,
+			'transient_row_count'      => 0,
+			'expired_transient_count'  => 0,
+			'limit'                    => $limit,
+			'top_autoloaded_options'   => array(),
+			'issue_count'              => 1,
+			'issues'                   => array( array( 'code' => 'options_health_query_failed', 'severity' => 'error', 'message' => 'Options health metadata could not be read.' ) ),
+			'message'                  => 'Options health audit failed.',
+		);
+	}
+
+	$wpdb->last_error = '';
+	// Names and byte sizes are bounded diagnostic metadata; option values are never selected.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$top_rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT option_name, autoload, OCTET_LENGTH(option_value) AS value_bytes FROM %i WHERE autoload IN (%s, %s, %s, %s) ORDER BY value_bytes DESC, option_name ASC LIMIT %d",
+			...array_merge( array( $wpdb->options ), $autoload_values, array( $limit ) )
+		),
+		ARRAY_A
+	);
+	$top_rows = is_array( $top_rows ) && '' === $wpdb->last_error ? $top_rows : array();
+	$top_options = array_map(
+		static fn( array $row ): array => array(
+			'option_name' => (string) ( $row['option_name'] ?? '' ),
+			'autoload'    => (string) ( $row['autoload'] ?? '' ),
+			'value_bytes' => (int) ( $row['value_bytes'] ?? 0 ),
+		),
+		$top_rows
+	);
+
+	$autoload_bytes           = (int) ( $summary['autoload_bytes'] ?? 0 );
+	$oversized_autoload_count = (int) ( $summary['oversized_autoload_count'] ?? 0 );
+	$expired_transient_count  = (int) ( $summary['expired_transient_count'] ?? 0 );
+	$issues                    = array();
+	if ( $autoload_bytes > 800000 ) {
+		$issues[] = array( 'code' => 'autoload_total_large', 'severity' => 'warning', 'message' => 'Total autoloaded option values exceed 800,000 bytes.' );
+	}
+	if ( $oversized_autoload_count > 0 ) {
+		$issues[] = array( 'code' => 'oversized_autoloaded_options', 'severity' => 'review', 'message' => 'One or more autoloaded options are at least 262,144 bytes.' );
+	}
+	if ( $expired_transient_count > 0 ) {
+		$issues[] = array( 'code' => 'expired_transients_present', 'severity' => 'review', 'message' => 'Expired transient timeout rows are present.' );
+	}
+
+	return array(
+		'success'                  => true,
+		'observed_at'              => gmdate( 'c' ),
+		'option_count'             => (int) ( $summary['option_count'] ?? 0 ),
+		'total_value_bytes'        => (int) ( $summary['total_value_bytes'] ?? 0 ),
+		'autoload_count'           => (int) ( $summary['autoload_count'] ?? 0 ),
+		'autoload_bytes'           => $autoload_bytes,
+		'oversized_autoload_count' => $oversized_autoload_count,
+		'transient_row_count'      => (int) ( $summary['transient_row_count'] ?? 0 ),
+		'expired_transient_count'  => $expired_transient_count,
+		'limit'                    => $limit,
+		'top_autoloaded_options'   => $top_options,
+		'issue_count'              => count( $issues ),
+		'issues'                   => $issues,
+		'message'                  => sprintf( 'Audited %d options, including %d autoloaded rows and %d expired transient timeout rows.', (int) ( $summary['option_count'] ?? 0 ), (int) ( $summary['autoload_count'] ?? 0 ), $expired_transient_count ),
+	);
+}
+
+/**
+ * Return one bounded, correlated database health snapshot.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_audit_health(): array {
+	$index_health   = mcp_database_audit_index_health( array( 'limit' => 1, 'offset' => 0 ) );
+	$options_health = mcp_database_audit_options_health( array( 'limit' => 5 ) );
+	$issue_counts   = array();
+	foreach ( (array) ( $index_health['issues'] ?? array() ) as $issue ) {
+		$code = sanitize_key( (string) ( $issue['code'] ?? '' ) );
+		if ( '' !== $code ) {
+			$issue_counts[ $code ] = (int) ( $issue_counts[ $code ] ?? 0 ) + 1;
+		}
+	}
+
+	return array(
+		'success'     => ! empty( $index_health['success'] ) && ! empty( $options_health['success'] ),
+		'observed_at' => gmdate( 'c' ),
+		'scope'       => 'current_site',
+		'coverage'    => array(
+			'storage_and_indexes' => ! empty( $index_health['success'] ) ? 'complete' : 'unavailable',
+			'options'             => ! empty( $options_health['success'] ) ? 'complete' : 'unavailable',
+			'core_data_integrity' => 'not_run',
+			'query_workload'      => ! empty( $index_health['usage_counters_available'] ) ? 'index_counters_available' : 'unavailable',
+		),
+		'storage'     => array(
+			'table_count'       => (int) ( $index_health['total_table_count'] ?? 0 ),
+			'data_bytes'        => (int) ( $index_health['total_data_bytes'] ?? 0 ),
+			'index_bytes'       => (int) ( $index_health['total_index_bytes'] ?? 0 ),
+			'free_bytes'        => (int) ( $index_health['total_free_bytes'] ?? 0 ),
+			'engine_counts'     => (array) ( $index_health['engine_counts'] ?? array() ),
+		),
+		'indexes'     => array(
+			'issue_count'              => (int) ( $index_health['issue_count'] ?? 0 ),
+			'issue_counts'             => $issue_counts,
+			'usage_counters_available' => ! empty( $index_health['usage_counters_available'] ),
+		),
+		'options'     => array(
+			'option_count'             => (int) ( $options_health['option_count'] ?? 0 ),
+			'total_value_bytes'        => (int) ( $options_health['total_value_bytes'] ?? 0 ),
+			'autoload_count'           => (int) ( $options_health['autoload_count'] ?? 0 ),
+			'autoload_bytes'           => (int) ( $options_health['autoload_bytes'] ?? 0 ),
+			'oversized_autoload_count' => (int) ( $options_health['oversized_autoload_count'] ?? 0 ),
+			'expired_transient_count'  => (int) ( $options_health['expired_transient_count'] ?? 0 ),
+			'issue_count'              => (int) ( $options_health['issue_count'] ?? 0 ),
+		),
+		'message'     => 'Returned a bounded current-site database health snapshot. Use the focused index and options audits for details.',
 	);
 }
 
@@ -1081,6 +1638,211 @@ function mcp_database_table_engine_conversion_record_schema(): array {
 }
 
 /**
+ * Get the output schema for the read-only index health audit.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_index_health_output_schema(): array {
+	$nullable_integer = array( 'type' => array( 'integer', 'null' ) );
+	$nullable_string  = array( 'type' => array( 'string', 'null' ) );
+	$index_schema     = array(
+		'type'                 => 'object',
+		'required'             => array( 'name', 'unique', 'primary', 'type', 'columns', 'cardinality', 'count_read', 'count_write', 'count_fetch' ),
+		'properties'           => array(
+			'name'        => array( 'type' => 'string' ),
+			'unique'      => array( 'type' => 'boolean' ),
+			'primary'     => array( 'type' => 'boolean' ),
+			'type'        => array( 'type' => 'string' ),
+			'columns'     => array( 'type' => 'array', 'items' => array( 'type' => 'string' ) ),
+			'cardinality' => array( 'type' => 'integer' ),
+			'count_read'  => $nullable_integer,
+			'count_write' => $nullable_integer,
+			'count_fetch' => $nullable_integer,
+		),
+		'additionalProperties' => false,
+	);
+	$issue_schema = array(
+		'type'                 => 'object',
+		'required'             => array( 'code', 'severity', 'table_name', 'index_name', 'related_index_name', 'message' ),
+		'properties'           => array(
+			'code'               => array( 'type' => 'string' ),
+			'severity'           => array( 'type' => 'string', 'enum' => array( 'error', 'warning', 'review' ) ),
+			'table_name'         => array( 'type' => 'string' ),
+			'index_name'         => array( 'type' => 'string' ),
+			'related_index_name' => array( 'type' => 'string' ),
+			'message'            => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+	$table_schema = array(
+		'type'                 => 'object',
+		'required'             => array( 'table_name', 'engine', 'row_format', 'collation', 'rows_estimate', 'data_bytes', 'index_bytes', 'data_free_bytes', 'index_count', 'has_primary_key', 'duplicate_candidate_count', 'unused_observation_count', 'indexes' ),
+		'properties'           => array(
+			'table_name'                => array( 'type' => 'string' ),
+			'engine'                    => $nullable_string,
+			'row_format'                => $nullable_string,
+			'collation'                 => $nullable_string,
+			'rows_estimate'             => $nullable_integer,
+			'data_bytes'                => array( 'type' => 'integer' ),
+			'index_bytes'               => array( 'type' => 'integer' ),
+			'data_free_bytes'           => array( 'type' => 'integer' ),
+			'index_count'               => array( 'type' => 'integer' ),
+			'has_primary_key'           => array( 'type' => 'boolean' ),
+			'duplicate_candidate_count' => array( 'type' => 'integer' ),
+			'unused_observation_count'  => array( 'type' => 'integer' ),
+			'indexes'                   => array( 'type' => 'array', 'items' => $index_schema ),
+		),
+		'additionalProperties' => false,
+	);
+
+	return array(
+		'type'                 => 'object',
+		'required'             => array( 'success', 'observed_at', 'scope', 'table_prefix', 'total_table_count', 'returned_table_count', 'table_count', 'limit', 'offset', 'next_offset', 'total_data_bytes', 'total_index_bytes', 'total_free_bytes', 'engine_counts', 'usage_counters_available', 'issue_count', 'issues', 'tables', 'message' ),
+		'properties'           => array(
+			'success'                  => array( 'type' => 'boolean' ),
+			'observed_at'              => array( 'type' => 'string' ),
+			'scope'                    => array( 'type' => 'string', 'enum' => array( 'current_site' ) ),
+			'table_prefix'             => array( 'type' => 'string' ),
+			'total_table_count'        => array( 'type' => 'integer' ),
+			'returned_table_count'     => array( 'type' => 'integer' ),
+			'table_count'              => array( 'type' => 'integer' ),
+			'limit'                    => array( 'type' => 'integer' ),
+			'offset'                   => array( 'type' => 'integer' ),
+			'next_offset'              => $nullable_integer,
+			'total_data_bytes'         => array( 'type' => 'integer' ),
+			'total_index_bytes'        => array( 'type' => 'integer' ),
+			'total_free_bytes'         => array( 'type' => 'integer' ),
+			'engine_counts'            => array( 'type' => 'object', 'additionalProperties' => array( 'type' => 'integer' ) ),
+			'usage_counters_available' => array( 'type' => 'boolean' ),
+			'issue_count'              => array( 'type' => 'integer' ),
+			'issues'                   => array( 'type' => 'array', 'items' => $issue_schema ),
+			'tables'                   => array( 'type' => 'array', 'items' => $table_schema ),
+			'message'                  => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+}
+
+/**
+ * Get the output schema for the options health audit.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_options_health_output_schema(): array {
+	return array(
+		'type'                 => 'object',
+		'required'             => array( 'success', 'observed_at', 'option_count', 'total_value_bytes', 'autoload_count', 'autoload_bytes', 'oversized_autoload_count', 'transient_row_count', 'expired_transient_count', 'limit', 'top_autoloaded_options', 'issue_count', 'issues', 'message' ),
+		'properties'           => array(
+			'success'                  => array( 'type' => 'boolean' ),
+			'observed_at'              => array( 'type' => 'string' ),
+			'option_count'             => array( 'type' => 'integer' ),
+			'total_value_bytes'        => array( 'type' => 'integer' ),
+			'autoload_count'           => array( 'type' => 'integer' ),
+			'autoload_bytes'           => array( 'type' => 'integer' ),
+			'oversized_autoload_count' => array( 'type' => 'integer' ),
+			'transient_row_count'      => array( 'type' => 'integer' ),
+			'expired_transient_count'  => array( 'type' => 'integer' ),
+			'limit'                    => array( 'type' => 'integer' ),
+			'top_autoloaded_options'   => array(
+				'type'  => 'array',
+				'items' => array(
+					'type'                 => 'object',
+					'required'             => array( 'option_name', 'autoload', 'value_bytes' ),
+					'properties'           => array(
+						'option_name' => array( 'type' => 'string' ),
+						'autoload'    => array( 'type' => 'string' ),
+						'value_bytes' => array( 'type' => 'integer' ),
+					),
+					'additionalProperties' => false,
+				),
+			),
+			'issue_count'              => array( 'type' => 'integer' ),
+			'issues'                   => array(
+				'type'  => 'array',
+				'items' => array(
+					'type'                 => 'object',
+					'required'             => array( 'code', 'severity', 'message' ),
+					'properties'           => array(
+						'code'     => array( 'type' => 'string' ),
+						'severity' => array( 'type' => 'string', 'enum' => array( 'error', 'warning', 'review' ) ),
+						'message'  => array( 'type' => 'string' ),
+					),
+					'additionalProperties' => false,
+				),
+			),
+			'message'                  => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+}
+
+/**
+ * Get the output schema for the bounded database health snapshot.
+ *
+ * @return array<string, mixed>
+ */
+function mcp_database_health_output_schema(): array {
+	return array(
+		'type'                 => 'object',
+		'required'             => array( 'success', 'observed_at', 'scope', 'coverage', 'storage', 'indexes', 'options', 'message' ),
+		'properties'           => array(
+			'success'     => array( 'type' => 'boolean' ),
+			'observed_at' => array( 'type' => 'string' ),
+			'scope'       => array( 'type' => 'string', 'enum' => array( 'current_site' ) ),
+			'coverage'    => array(
+				'type'                 => 'object',
+				'required'             => array( 'storage_and_indexes', 'options', 'core_data_integrity', 'query_workload' ),
+				'properties'           => array(
+					'storage_and_indexes' => array( 'type' => 'string' ),
+					'options'             => array( 'type' => 'string' ),
+					'core_data_integrity' => array( 'type' => 'string' ),
+					'query_workload'      => array( 'type' => 'string' ),
+				),
+				'additionalProperties' => false,
+			),
+			'storage'     => array(
+				'type'                 => 'object',
+				'required'             => array( 'table_count', 'data_bytes', 'index_bytes', 'free_bytes', 'engine_counts' ),
+				'properties'           => array(
+					'table_count'   => array( 'type' => 'integer' ),
+					'data_bytes'    => array( 'type' => 'integer' ),
+					'index_bytes'   => array( 'type' => 'integer' ),
+					'free_bytes'    => array( 'type' => 'integer' ),
+					'engine_counts' => array( 'type' => 'object', 'additionalProperties' => array( 'type' => 'integer' ) ),
+				),
+				'additionalProperties' => false,
+			),
+			'indexes'     => array(
+				'type'                 => 'object',
+				'required'             => array( 'issue_count', 'issue_counts', 'usage_counters_available' ),
+				'properties'           => array(
+					'issue_count'              => array( 'type' => 'integer' ),
+					'issue_counts'             => array( 'type' => 'object', 'additionalProperties' => array( 'type' => 'integer' ) ),
+					'usage_counters_available' => array( 'type' => 'boolean' ),
+				),
+				'additionalProperties' => false,
+			),
+			'options'     => array(
+				'type'                 => 'object',
+				'required'             => array( 'option_count', 'total_value_bytes', 'autoload_count', 'autoload_bytes', 'oversized_autoload_count', 'expired_transient_count', 'issue_count' ),
+				'properties'           => array(
+					'option_count'             => array( 'type' => 'integer' ),
+					'total_value_bytes'        => array( 'type' => 'integer' ),
+					'autoload_count'           => array( 'type' => 'integer' ),
+					'autoload_bytes'           => array( 'type' => 'integer' ),
+					'oversized_autoload_count' => array( 'type' => 'integer' ),
+					'expired_transient_count'  => array( 'type' => 'integer' ),
+					'issue_count'              => array( 'type' => 'integer' ),
+				),
+				'additionalProperties' => false,
+			),
+			'message'     => array( 'type' => 'string' ),
+		),
+		'additionalProperties' => false,
+	);
+}
+
+/**
  * Register database abilities.
  */
 function mcp_register_database_abilities(): void {
@@ -1089,6 +1851,83 @@ function mcp_register_database_abilities(): void {
 	}
 
 	$core_table_keys = array_keys( mcp_database_core_table_allowlist() );
+
+	wp_register_ability(
+		'database/audit-health',
+		array(
+			'label'               => 'Audit Database Health',
+			'description'         => 'Returns one bounded, timestamped current-site snapshot of storage engines, table and index size, index findings, options/autoload health, and observability coverage.',
+			'category'            => 'site',
+			'input_schema'        => array( 'type' => 'object', 'default' => array(), 'properties' => array(), 'additionalProperties' => false ),
+			'output_schema'       => mcp_database_health_output_schema(),
+			'execute_callback'    => static function ( $input = array() ): array {
+				unset( $input );
+				return mcp_database_audit_health();
+			},
+			'permission_callback' => static function ( $input = array() ): bool {
+				unset( $input );
+				return mcp_database_can_audit_index_health();
+			},
+			'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false, 'idempotent' => true ) ),
+		)
+	);
+
+	wp_register_ability(
+		'database/audit-options-health',
+		array(
+			'label'               => 'Audit WordPress Options Health',
+			'description'         => 'Read-only bounded audit of option value size, autoload volume, large autoloaded option names and sizes, and expired transient counts. Option values are never returned.',
+			'category'            => 'site',
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'default'              => array(),
+				'properties'           => array( 'limit' => array( 'type' => 'integer', 'default' => 10, 'minimum' => 1, 'maximum' => 50 ) ),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => mcp_database_options_health_output_schema(),
+			'execute_callback'    => static function ( $input = array() ): array {
+				return mcp_database_audit_options_health( is_array( $input ) ? $input : array() );
+			},
+			'permission_callback' => static function ( $input = array() ): bool {
+				unset( $input );
+				return current_user_can( 'manage_options' );
+			},
+			'meta'                => array( 'annotations' => array( 'readonly' => true, 'destructive' => false, 'idempotent' => true ) ),
+		)
+	);
+
+	wp_register_ability(
+		'database/audit-index-health',
+		array(
+			'label'               => 'Audit Database Index Health',
+			'description'         => 'Read-only index, storage-size, duplicate-index, core-index-shape, and optional Performance Schema usage audit for tables owned by the current WordPress site prefix.',
+			'category'            => 'site',
+			'input_schema'        => array(
+				'type'                 => 'object',
+				'default'              => array(),
+				'properties'           => array(
+					'limit'  => array( 'type' => 'integer', 'default' => 25, 'minimum' => 1, 'maximum' => 100 ),
+					'offset' => array( 'type' => 'integer', 'default' => 0, 'minimum' => 0 ),
+				),
+				'additionalProperties' => false,
+			),
+			'output_schema'       => mcp_database_index_health_output_schema(),
+			'execute_callback'    => static function ( $input = array() ): array {
+				return mcp_database_audit_index_health( is_array( $input ) ? $input : array() );
+			},
+			'permission_callback' => static function ( $input = array() ): bool {
+				unset( $input );
+				return mcp_database_can_audit_index_health();
+			},
+			'meta'                => array(
+				'annotations' => array(
+					'readonly'    => true,
+					'destructive' => false,
+					'idempotent'  => true,
+				),
+			),
+		)
+	);
 
 	wp_register_ability(
 		'database/audit-core-table-engines',
@@ -1128,11 +1967,11 @@ function mcp_register_database_abilities(): void {
 				),
 				'additionalProperties' => false,
 			),
-			'execute_callback'    => static function ( array $input = array() ): array {
-				return mcp_database_audit_core_table_engines( $input );
+			'execute_callback'    => static function ( $input = array() ): array {
+				return mcp_database_audit_core_table_engines( is_array( $input ) ? $input : array() );
 			},
-			'permission_callback' => static function ( array $input = array() ): bool {
-				return mcp_database_can_manage_core_table_request( $input, true );
+			'permission_callback' => static function ( $input = array() ): bool {
+				return mcp_database_can_manage_core_table_request( is_array( $input ) ? $input : array(), true );
 			},
 			'meta'                => array(
 				'annotations' => array(
