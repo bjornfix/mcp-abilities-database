@@ -14,6 +14,8 @@ Controlled database maintenance abilities for MCP.
 
 This plugin exposes confirm-gated MCP abilities for database maintenance tasks.
 
+Download the stable plugin ZIP from https://downloads.devenia.com/mcp-abilities-database.zip.
+
 Current abilities:
 
 * `database/search-replace-post-content` - search/replace inside `wp_posts.post_content` for selected post types and statuses. Dry-run is the default, and live writes require `confirm=true`.
